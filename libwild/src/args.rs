@@ -173,6 +173,7 @@ const SILENTLY_IGNORED_FLAGS: &[&str] = &[
     "undefined-version",
     "sort-common",
     "no-relax",
+    "enable-new-dtags",
 ];
 
 const IGNORED_FLAGS: &[&str] = &["gdb-index", "disable-new-dtags"];
