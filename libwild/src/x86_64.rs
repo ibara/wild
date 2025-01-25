@@ -271,15 +271,8 @@ impl crate::arch::Relaxation for Relaxation {
         None
     }
 
-    fn apply(
-        &self,
-        section_bytes: &mut [u8],
-        offset_in_section: &mut u64,
-        addend: &mut u64,
-        next_modifier: &mut RelocationModifier,
-    ) {
-        self.kind
-            .apply(section_bytes, offset_in_section, addend, next_modifier);
+    fn apply(&self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut u64) {
+        self.kind.apply(section_bytes, offset_in_section, addend);
     }
 
     fn rel_info(&self) -> crate::elf::RelocationKindInfo {
@@ -288,6 +281,10 @@ impl crate::arch::Relaxation for Relaxation {
 
     fn debug_kind(&self) -> impl std::fmt::Debug {
         &self.kind
+    }
+
+    fn next_modifier(&self) -> RelocationModifier {
+        self.kind.next_modifier()
     }
 }
 
@@ -322,7 +319,6 @@ fn test_relaxation() {
     fn check(relocation_kind: u32, bytes_in: &[u8], address: &[u8], absolute: &[u8]) {
         let mut out = bytes_in.to_owned();
         let mut offset = bytes_in.len() as u64;
-        let mut modifier = RelocationModifier::Normal;
         if let Some(r) = Relaxation::new(
             relocation_kind,
             bytes_in,
@@ -331,7 +327,7 @@ fn test_relaxation() {
             OutputKind::StaticExecutable(RelocationModel::Relocatable),
             shf::EXECINSTR,
         ) {
-            r.apply(&mut out, &mut offset, &mut 0, &mut modifier);
+            r.apply(&mut out, &mut offset, &mut 0);
 
             assert_eq!(
                 out, address,
@@ -347,7 +343,7 @@ fn test_relaxation() {
             shf::EXECINSTR,
         ) {
             out.copy_from_slice(bytes_in);
-            r.apply(&mut out, &mut offset, &mut 0, &mut modifier);
+            r.apply(&mut out, &mut offset, &mut 0);
             assert_eq!(
                 out, absolute,
                 "unresolved: Expected {absolute:x?}, got {out:x?}"

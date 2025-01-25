@@ -45,13 +45,7 @@ pub enum RelaxationKind {
 }
 
 impl RelaxationKind {
-    pub fn apply(
-        self,
-        section_bytes: &mut [u8],
-        offset_in_section: &mut u64,
-        addend: &mut u64,
-        next_modifier: &mut RelocationModifier,
-    ) {
+    pub fn apply(self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut u64) {
         let offset = *offset_in_section as usize;
         match self {
             RelaxationKind::MovIndirectToLea => {
@@ -103,7 +97,6 @@ impl RelaxationKind {
                 ]);
                 *offset_in_section += 8;
                 *addend = 0;
-                *next_modifier = RelocationModifier::SkipNextRelocation;
             }
             RelaxationKind::TlsGdToLocalExecLarge => {
                 section_bytes[offset - 3..offset + 19].copy_from_slice(&[
@@ -113,20 +106,17 @@ impl RelaxationKind {
                 ]);
                 *offset_in_section += 9;
                 *addend = 0;
-                *next_modifier = RelocationModifier::SkipNextRelocation;
             }
             RelaxationKind::TlsGdToInitialExec => {
                 section_bytes[offset - 4..offset + 8]
                     .copy_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x03, 0x05]);
                 *offset_in_section += 8;
                 *addend = -12_i64 as u64;
-                *next_modifier = RelocationModifier::SkipNextRelocation;
             }
             RelaxationKind::TlsLdToLocalExec => {
                 section_bytes[offset - 3..offset + 9]
                     .copy_from_slice(&[0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
                 *offset_in_section += 5;
-                *next_modifier = RelocationModifier::SkipNextRelocation;
             }
             RelaxationKind::TlsLdToLocalExec64 => {
                 section_bytes[offset - 3..offset + 19].copy_from_slice(&[
@@ -136,9 +126,20 @@ impl RelaxationKind {
                     0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
                 ]);
                 *offset_in_section += 15;
-                *next_modifier = RelocationModifier::SkipNextRelocation;
             }
             RelaxationKind::NoOp => {}
+        }
+    }
+
+    #[must_use]
+    pub fn next_modifier(&self) -> RelocationModifier {
+        match self {
+            RelaxationKind::TlsGdToInitialExec
+            | RelaxationKind::TlsGdToLocalExec
+            | RelaxationKind::TlsGdToLocalExecLarge
+            | RelaxationKind::TlsLdToLocalExec
+            | RelaxationKind::TlsLdToLocalExec64 => RelocationModifier::SkipNextRelocation,
+            _ => RelocationModifier::Normal,
         }
     }
 }

@@ -746,6 +746,64 @@ impl crate::arch::Arch for AArch64 {
                 None,
             ),
 
+            // 5.7.11.5 Thread-local storage descriptors
+            object::elf::R_AARCH64_TLSDESC_LD_PREL19 => (
+                RelocationKind::TlsDesc,
+                RelocationSize::BitMasking {
+                    range: BitRange { start: 2, end: 21 },
+                    insn: RelocationInstruction::Ldr,
+                },
+                None,
+            ),
+            object::elf::R_AARCH64_TLSDESC_ADR_PREL21 => (
+                RelocationKind::TlsDesc,
+                RelocationSize::BitMasking {
+                    range: BitRange { start: 0, end: 21 },
+                    insn: RelocationInstruction::Adr,
+                },
+                None,
+            ),
+            object::elf::R_AARCH64_TLSDESC_ADR_PAGE21 => (
+                RelocationKind::TlsDesc,
+                RelocationSize::BitMasking {
+                    range: BitRange { start: 12, end: 33 },
+                    insn: RelocationInstruction::Adr,
+                },
+                Some(PageMask::GotEntryAndPosition),
+            ),
+            object::elf::R_AARCH64_TLSDESC_LD64_LO12 => (
+                RelocationKind::TlsDescGot,
+                RelocationSize::BitMasking {
+                    range: BitRange { start: 3, end: 12 },
+                    insn: RelocationInstruction::Ldr,
+                },
+                None,
+            ),
+            object::elf::R_AARCH64_TLSDESC_ADD_LO12 => (
+                RelocationKind::TlsDescGot,
+                RelocationSize::BitMasking {
+                    range: BitRange { start: 0, end: 12 },
+                    insn: RelocationInstruction::Add,
+                },
+                None,
+            ),
+            object::elf::R_AARCH64_TLSDESC_OFF_G1 => (
+                RelocationKind::TlsDescGotBase,
+                RelocationSize::BitMasking {
+                    range: BitRange { start: 16, end: 32 },
+                    insn: RelocationInstruction::Movnz,
+                },
+                None,
+            ),
+            object::elf::R_AARCH64_TLSDESC_OFF_G0_NC => (
+                RelocationKind::TlsDescGotBase,
+                RelocationSize::BitMasking {
+                    range: BitRange { start: 0, end: 16 },
+                    insn: RelocationInstruction::Movkz,
+                },
+                None,
+            ),
+
             _ => bail!(
                 "Unsupported relocation type {}",
                 Self::rel_type_to_string(r_type)
@@ -817,14 +875,7 @@ impl crate::arch::Relaxation for () {
     }
 
     #[allow(unused_variables)]
-    fn apply(
-        &self,
-        section_bytes: &mut [u8],
-        offset_in_section: &mut u64,
-        addend: &mut u64,
-        next_modifier: &mut RelocationModifier,
-    ) {
-    }
+    fn apply(&self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut u64) {}
 
     fn rel_info(&self) -> crate::elf::RelocationKindInfo {
         RelocationKindInfo {
@@ -836,6 +887,10 @@ impl crate::arch::Relaxation for () {
 
     fn debug_kind(&self) -> impl std::fmt::Debug {
         todo!()
+    }
+
+    fn next_modifier(&self) -> RelocationModifier {
+        RelocationModifier::Normal
     }
 }
 

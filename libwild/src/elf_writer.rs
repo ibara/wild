@@ -1829,7 +1829,8 @@ fn apply_relocation<S: StorageModel, A: Arch>(
     ) {
         tracing::trace!(kind = ?relaxation.debug_kind(), %value_flags, %resolution_flags);
         rel_info = relaxation.rel_info();
-        relaxation.apply(out, &mut offset_in_section, &mut addend, &mut next_modifier);
+        relaxation.apply(out, &mut offset_in_section, &mut addend);
+        next_modifier = relaxation.next_modifier();
     } else {
         tracing::trace!(%value_flags, %resolution_flags);
         rel_info = A::relocation_from_raw(r_type)?;
@@ -1957,6 +1958,15 @@ fn apply_relocation<S: StorageModel, A: Arch>(
             .bitand(mask.got_entry)
             .wrapping_add(addend)
             .wrapping_sub(place.bitand(mask.place)),
+        RelocationKind::TlsDescGot => resolution
+            .tls_descriptor_got_address()?
+            .bitand(mask.got_entry)
+            .wrapping_add(addend),
+        RelocationKind::TlsDescGotBase => resolution
+            .tls_descriptor_got_address()?
+            .bitand(mask.got_entry)
+            .wrapping_add(addend)
+            .wrapping_sub(layout.got_base().bitand(mask.got)),
         RelocationKind::None | RelocationKind::TlsDescCall => 0,
     };
     rel_info

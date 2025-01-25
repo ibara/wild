@@ -3,6 +3,7 @@
 //! where in the output file then allocates addresses for each symbol.
 
 use self::elf::NoteHeader;
+use self::elf::Symbol;
 use self::elf::GNU_NOTE_NAME;
 use self::elf::GNU_NOTE_PROPERTY_ENTRY_SIZE;
 use self::output_section_id::InfoInputs;
@@ -71,6 +72,7 @@ use itertools::Itertools;
 use linker_utils::elf::shf;
 use linker_utils::elf::RelocationKind;
 use linker_utils::elf::SectionFlags;
+use linker_utils::relaxation::RelocationModifier;
 use object::elf::gnu_hash;
 use object::elf::Rela64;
 use object::elf::GNU_PROPERTY_AARCH64_FEATURE_1_AND;
@@ -2397,8 +2399,9 @@ fn process_relocation<S: StorageModel, A: Arch>(
     section: &object::elf::SectionHeader64<LittleEndian>,
     resources: &GraphResources<S>,
     queue: &mut LocalWorkQueue,
-) -> Result {
+) -> Result<RelocationModifier> {
     let args = resources.symbol_db.args;
+    let mut next_modifier = RelocationModifier::Normal;
     if let Some(local_sym_index) = rel.symbol(LittleEndian, false) {
         let symbol_db = resources.symbol_db;
         let symbol_id = symbol_db.definition(object.symbol_id_range.input_to_id(local_sym_index));
@@ -2415,6 +2418,7 @@ fn process_relocation<S: StorageModel, A: Arch>(
             args.output_kind(),
             SectionFlags::from_header(section),
         ) {
+            next_modifier = relaxation.next_modifier();
             relaxation.rel_info()
         } else {
             A::relocation_from_raw(r_type)?
@@ -2452,6 +2456,20 @@ fn process_relocation<S: StorageModel, A: Arch>(
 
         if previous_flags.is_empty() {
             queue.send_symbol_request(symbol_id, resources);
+            if is_symbol_undefined(
+                object.object.symbol(local_sym_index)?,
+                object.file_id,
+                symbol_db.file_id_for_symbol(symbol_id),
+                symbol_value_flags,
+                args,
+            ) {
+                let symbol_name = symbol_db.symbol_name(symbol_id)?;
+                resources.report_error(anyhow::anyhow!(
+                    "Undefined symbol {}, referenced by {}",
+                    String::from_utf8_lossy(symbol_name.bytes()),
+                    object.input
+                ));
+            }
         }
 
         if resolution_kind.contains(ResolutionFlags::COPY_RELOCATION)
@@ -2460,7 +2478,7 @@ fn process_relocation<S: StorageModel, A: Arch>(
             queue.send_copy_relocation_request(symbol_id, resources);
         }
     }
-    Ok(())
+    Ok(next_modifier)
 }
 
 /// Returns whether the supplied relocation type requires static TLS. If true and we're writing a
@@ -2482,9 +2500,10 @@ fn resolution_flags(rel_kind: RelocationKind) -> ResolutionFlags {
         RelocationKind::TlsGd | RelocationKind::TlsGdGot | RelocationKind::TlsGdGotBase => {
             ResolutionFlags::GOT_TLS_MODULE
         }
-        RelocationKind::TlsDesc | RelocationKind::TlsDescCall => {
-            ResolutionFlags::GOT_TLS_DESCRIPTOR
-        }
+        RelocationKind::TlsDesc
+        | RelocationKind::TlsDescGot
+        | RelocationKind::TlsDescGotBase
+        | RelocationKind::TlsDescCall => ResolutionFlags::GOT_TLS_DESCRIPTOR,
         RelocationKind::TlsLd | RelocationKind::TlsLdGot | RelocationKind::TlsLdGotBase => {
             ResolutionFlags::empty()
         }
@@ -2874,6 +2893,22 @@ fn create_start_end_symbol_resolution<S: StorageModel>(
     ))
 }
 
+fn is_symbol_undefined(
+    symbol: &Symbol,
+    sym_file_id: FileId,
+    sym_def_file_id: FileId,
+    symbol_value_flags: ValueFlags,
+    args: &Args,
+) -> bool {
+    if (args.output_kind() == OutputKind::SharedObject && !args.no_undefined) || symbol.is_weak() {
+        return false;
+    }
+
+    sym_file_id == sym_def_file_id
+        && symbol.is_undefined(LittleEndian)
+        && symbol_value_flags.contains(ValueFlags::ABSOLUTE)
+}
+
 impl<'data> EpilogueLayoutState<'data> {
     fn activate<S: StorageModel>(
         &mut self,
@@ -3208,8 +3243,13 @@ impl<'data> ObjectLayoutState<'data> {
     ) -> Result {
         let part_id = unloaded.part_id;
         let section = Section::create(self, section_id, part_id)?;
+        let mut modifier = RelocationModifier::Normal;
         for rel in self.object.relocations(section.index)? {
-            process_relocation::<S, A>(
+            if modifier == RelocationModifier::SkipNextRelocation {
+                modifier = RelocationModifier::Normal;
+                continue;
+            }
+            modifier = process_relocation::<S, A>(
                 self,
                 common,
                 rel,

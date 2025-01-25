@@ -185,7 +185,7 @@ fn host_supports_clang_with_tls_desc() -> bool {
         let echo_out = echo_child.stdout.expect("Failed to open echo stdout");
 
         let clang = Command::new("clang")
-            .args(["-mtls-dialect=gnu2", "-x", "c", "-"])
+            .args(["-mtls-dialect=gnu2", "-x", "c", "-", "-o/dev/null"])
             .stdin(Stdio::from(echo_out))
             .output()
             .expect("Failed to run clang");
@@ -1408,7 +1408,8 @@ fn integration_test(
         "rust-tls.rs",
         "input_does_not_exist.c",
         "ifunc2.c",
-        "tls-local-exec.c"
+        "tls-local-exec.c",
+        "undefined_symbols.c"
     )]
     program_name: &'static str,
     #[allow(unused_variables)] setup_symlink: (),
