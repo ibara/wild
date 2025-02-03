@@ -509,6 +509,10 @@ pub enum RelocationKind {
     /// The absolute address of a symbol or section.
     Absolute,
 
+    /// The absolute address of a symbol or section. We are going to extract only the offset
+    /// within a page, so dynamic relocation creation must be skipped.
+    AbsoluteAArch64,
+
     /// The address of the symbol, relative to the place of the relocation.
     Relative,
 
@@ -589,4 +593,52 @@ pub enum RelocationKind {
     /// No relocation needs to be applied. Produced when we eliminate a relocation due to an
     /// optimisation.
     None,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DynamicRelocationKind {
+    Copy,
+    Irelative,
+    DtpMod,
+    DtpOff,
+    TlsDesc,
+    TpOff,
+    Relative,
+    DynamicSymbol,
+    JumpSlot,
+}
+
+impl DynamicRelocationKind {
+    #[must_use]
+    pub fn from_x86_64_r_type(r_type: u32) -> Option<Self> {
+        let kind = match r_type {
+            object::elf::R_X86_64_COPY => DynamicRelocationKind::Copy,
+            object::elf::R_X86_64_IRELATIVE => DynamicRelocationKind::Irelative,
+            object::elf::R_X86_64_DTPMOD64 => DynamicRelocationKind::DtpMod,
+            object::elf::R_X86_64_DTPOFF64 => DynamicRelocationKind::DtpOff,
+            object::elf::R_X86_64_TPOFF64 => DynamicRelocationKind::TpOff,
+            object::elf::R_X86_64_RELATIVE => DynamicRelocationKind::Relative,
+            object::elf::R_X86_64_GLOB_DAT => DynamicRelocationKind::DynamicSymbol,
+            object::elf::R_X86_64_TLSDESC => DynamicRelocationKind::TlsDesc,
+            object::elf::R_X86_64_JUMP_SLOT => DynamicRelocationKind::JumpSlot,
+            _ => return None,
+        };
+
+        Some(kind)
+    }
+
+    #[must_use]
+    pub fn x86_64_r_type(self) -> u32 {
+        match self {
+            DynamicRelocationKind::Copy => object::elf::R_X86_64_COPY,
+            DynamicRelocationKind::Irelative => object::elf::R_X86_64_IRELATIVE,
+            DynamicRelocationKind::DtpMod => object::elf::R_X86_64_DTPMOD64,
+            DynamicRelocationKind::DtpOff => object::elf::R_X86_64_DTPOFF64,
+            DynamicRelocationKind::TpOff => object::elf::R_X86_64_TPOFF64,
+            DynamicRelocationKind::Relative => object::elf::R_X86_64_RELATIVE,
+            DynamicRelocationKind::DynamicSymbol => object::elf::R_X86_64_GLOB_DAT,
+            DynamicRelocationKind::TlsDesc => object::elf::R_X86_64_TLSDESC,
+            DynamicRelocationKind::JumpSlot => object::elf::R_X86_64_JUMP_SLOT,
+        }
+    }
 }

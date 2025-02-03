@@ -1,7 +1,7 @@
 use crate::elf::RelocationKind;
 use crate::relaxation::RelocationModifier;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelaxationKind {
     /// Transforms a mov instruction that would have loaded an address to not use the GOT. The
     /// transformation will look like `mov *x(%rip), reg` -> `lea x(%rip), reg`.
@@ -24,6 +24,9 @@ pub enum RelaxationKind {
     /// Transform a call instruction like `call *x(%rip)` -> `call x(%rip)`.
     CallIndirectToRelative,
 
+    /// Transform a jump instruction like `jmp *x(%rip)` -> `jmp x(%rip)`.
+    JmpIndirectToRelative,
+
     /// Leave the instruction alone. Used when we only want to change the kind of relocation used.
     NoOp,
 
@@ -42,10 +45,16 @@ pub enum RelaxationKind {
 
     /// Transform general dynamic (GD) into initial exec
     TlsGdToInitialExec,
+
+    // Transform TLSDESC to local exec for a statically linked executables.
+    TlsDescToLocalExec,
+
+    /// Convert a TLSDESC_CALL to a no-op.
+    SkipTlsDescCall,
 }
 
 impl RelaxationKind {
-    pub fn apply(self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut u64) {
+    pub fn apply(self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut i64) {
         let offset = *offset_in_section as usize;
         match self {
             RelaxationKind::MovIndirectToLea => {
@@ -90,6 +99,10 @@ impl RelaxationKind {
             RelaxationKind::CallIndirectToRelative => {
                 section_bytes[offset - 2..offset].copy_from_slice(&[0x67, 0xe8]);
             }
+            RelaxationKind::JmpIndirectToRelative => {
+                section_bytes[offset - 2..offset + 4].copy_from_slice(&[0xe9, 0, 0, 0, 0, 0x90]);
+                *offset_in_section -= 1; // Instruction is 1 byte shorter
+            }
             RelaxationKind::TlsGdToLocalExec => {
                 section_bytes[offset - 4..offset + 8].copy_from_slice(&[
                     0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov %fs:0,%rax
@@ -108,14 +121,18 @@ impl RelaxationKind {
                 *addend = 0;
             }
             RelaxationKind::TlsGdToInitialExec => {
-                section_bytes[offset - 4..offset + 8]
-                    .copy_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x03, 0x05]);
+                section_bytes[offset - 4..offset + 8].copy_from_slice(&[
+                    // mov %fs:0,%rax
+                    0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // add *x,%rax
+                    0x48, 0x03, 0x05,
+                ]);
                 *offset_in_section += 8;
-                *addend = -12_i64 as u64;
             }
             RelaxationKind::TlsLdToLocalExec => {
-                section_bytes[offset - 3..offset + 9]
-                    .copy_from_slice(&[0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+                section_bytes[offset - 3..offset + 9].copy_from_slice(&[
+                    // mov %fs:0,%rax
+                    0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+                ]);
                 *offset_in_section += 5;
             }
             RelaxationKind::TlsLdToLocalExec64 => {
@@ -126,6 +143,19 @@ impl RelaxationKind {
                     0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
                 ]);
                 *offset_in_section += 15;
+            }
+            RelaxationKind::TlsDescToLocalExec => {
+                section_bytes[offset - 3..offset + 6].copy_from_slice(&[
+                    // mov {offset},%rax
+                    0x48, 0xc7, 0xc0, 0, 0, 0, 0, // xchg   %ax,%ax
+                    0x66, 0x90,
+                ]);
+            }
+            RelaxationKind::SkipTlsDescCall => {
+                section_bytes[offset..offset + 2].copy_from_slice(&[
+                    // xchg %ax,%ax
+                    0x66, 0x90,
+                ]);
             }
             RelaxationKind::NoOp => {}
         }
@@ -138,7 +168,8 @@ impl RelaxationKind {
             | RelaxationKind::TlsGdToLocalExec
             | RelaxationKind::TlsGdToLocalExecLarge
             | RelaxationKind::TlsLdToLocalExec
-            | RelaxationKind::TlsLdToLocalExec64 => RelocationModifier::SkipNextRelocation,
+            | RelaxationKind::TlsLdToLocalExec64
+            | RelaxationKind::TlsDescToLocalExec => RelocationModifier::SkipNextRelocation,
             _ => RelocationModifier::Normal,
         }
     }

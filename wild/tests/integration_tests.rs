@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Once;
 use std::sync::OnceLock;
+use std::time::Duration;
 use std::time::Instant;
 use wait_timeout::ChildExt;
 
@@ -1156,15 +1157,22 @@ impl Display for LinkCommand {
                 return Ok(());
             }
         }
+
         for sub in &self.input_commands {
             writeln!(f, "{sub}")?;
         }
-        let command_str = self.command.get_program().to_string_lossy();
+
+        let mut command_str = self.command.get_program().to_string_lossy();
+
         let mut args = self
             .command
             .get_args()
             .map(|a| a.to_string_lossy())
             .collect_vec();
+
+        if command_str == "bash" {
+            command_str = args.remove(0);
+        }
 
         match (self.invocation_mode, &self.linker) {
             (LinkerInvocationMode::Cc, Linker::Wild) => {
@@ -1182,8 +1190,10 @@ impl Display for LinkCommand {
                         v.and_then(|v| v.to_str()).unwrap_or_default(),
                     )?;
                 }
+
                 // The first argument is the linker, which we're replacing with `cargo run --`.
                 args.remove(0);
+
                 write!(
                     f,
                     "{} cargo run --bin wild -- {}",
@@ -1300,6 +1310,7 @@ fn diff_files(instructions: &Config, files: Vec<PathBuf>, display: &dyn Display)
     }
 
     let mut config = linker_diff::Config::default();
+    config.colour = linker_diff::Colour::Always;
     config.wild_defaults = true;
     config
         .ignore
@@ -1401,6 +1412,7 @@ fn integration_test(
         "eh_frame.c",
         "trivial_asm.s",
         "non-alloc.s",
+        "symbol-versions.c",
         "libc-integration.c",
         "rust-integration.rs",
         "rust-integration-dynamic.rs",
@@ -1414,6 +1426,8 @@ fn integration_test(
     program_name: &'static str,
     #[allow(unused_variables)] setup_symlink: (),
 ) -> Result {
+    workaround_wait_timeout_race();
+
     let program_inputs = ProgramInputs::new(program_name)?;
 
     let mut linkers = vec![
@@ -1517,4 +1531,28 @@ fn integration_test(
     }
 
     Ok(())
+}
+
+/// Apply a workaround for https://github.com/alexcrichton/wait-timeout/issues/36. This workaround
+/// should hopefully ensure that wait-timeout gets initialised before any other subprocesses get
+/// spawned, provided our test(s) call this before they spawn any other subprocesses. In theory, we
+/// could still trigger the race condition if our subprocess somehow managed to terminate before
+/// wait-timeout got initialised. This however, seems unlikely since process startup and shutdown
+/// isn't that fast even on Linux.
+fn workaround_wait_timeout_race() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        // It doesn't matter what we call here. The workaround appears to work perfectly well even
+        // with a fast running binary like `true`. However to reduce the chances that it'll
+        // terminate before wait-timeout initialises, thus triggering the bug, we pick a heavier
+        // binary.
+        let _ = Command::new("ld")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+            .wait_timeout(Duration::from_secs(1));
+    });
 }

@@ -852,16 +852,21 @@ impl<'data, S: StorageModel> SymbolRequestHandler<'data, S> for DynamicLayoutSta
         if symbol_db.args.output_kind() == OutputKind::SharedObject {
             bail!("Cannot directly access dynamic symbol when building a shared object",);
         }
+
         let symbol = self
             .object
             .symbol(self.symbol_id_range().id_to_input(symbol_id))?;
+
         let section_index = symbol.st_shndx(LittleEndian);
+
         if section_index == 0 {
             bail!("Cannot apply copy relocation for symbol");
         }
+
         let section = self
             .object
             .section(SectionIndex(usize::from(section_index)))?;
+
         let alignment = Alignment::new(self.object.section_alignment(section)?)?;
 
         // Allocate space in BSS for the copy of the symbol.
@@ -869,6 +874,13 @@ impl<'data, S: StorageModel> SymbolRequestHandler<'data, S> for DynamicLayoutSta
         common.allocate(
             output_section_id::BSS.part_id_with_alignment(alignment),
             st_size,
+        );
+
+        let entry_size = size_of::<elf::SymtabEntry>() as u64;
+        common.allocate(part_id::SYMTAB_GLOBAL, entry_size);
+        common.allocate(
+            part_id::STRTAB,
+            symbol_db.symbol_name(symbol_id)?.len() as u64 + 1,
         );
 
         Ok(())
@@ -1427,6 +1439,7 @@ impl<'data, S: StorageModel> Layout<'data, '_, S> {
         InfoInputs {
             section_part_layouts: &self.section_part_layouts,
             non_addressable_counts: &self.non_addressable_counts,
+            output_section_indexes: &self.output_sections.output_section_indexes,
         }
     }
 }
@@ -2515,6 +2528,7 @@ fn resolution_flags(rel_kind: RelocationKind) -> ResolutionFlags {
         | RelocationKind::SymRelGotBase
         | RelocationKind::Got
         | RelocationKind::None => ResolutionFlags::DIRECT,
+        RelocationKind::AbsoluteAArch64 => ResolutionFlags::empty(),
     }
 }
 
@@ -4017,7 +4031,7 @@ impl Resolution {
 
     pub(crate) fn value_with_addend(
         &self,
-        addend: u64,
+        addend: i64,
         symbol_index: object::SymbolIndex,
         object_layout: &ObjectLayout,
         merged_strings: &OutputSectionMap<MergedStringsSection>,
@@ -4042,7 +4056,7 @@ impl Resolution {
                 return Ok(r);
             }
         }
-        Ok(self.raw_value.wrapping_add(addend))
+        Ok(self.raw_value.wrapping_add(addend as u64))
     }
 }
 
@@ -4254,15 +4268,18 @@ impl<'data> DynamicLayoutState<'data> {
             let needs_copy_relocation = resolution_flags.contains(ResolutionFlags::COPY_RELOCATION);
             let address;
             let dynamic_symbol_index;
+
             if needs_copy_relocation {
                 address =
                     assign_copy_relocation_address(self.object, local_symbol, memory_offsets)?;
+
                 // Since this is a definition, the dynamic symbol index will be determined by the
                 // epilogue and set by `update_dynamic_symbol_resolutions`.
                 dynamic_symbol_index = None;
             } else {
                 address = 0;
                 let symbol_index = take_dynsym_index(memory_offsets, resources.section_layouts)?;
+
                 dynamic_symbol_index = Some(
                     NonZeroU32::new(symbol_index)
                         .context("Tried to create dynamic symbol index 0")?,
@@ -4276,6 +4293,7 @@ impl<'data> DynamicLayoutState<'data> {
                 ValueFlags::DYNAMIC,
                 memory_offsets,
             );
+
             resolutions_out.write(Some(resolution))?;
         }
 

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ '**' ]
+    branches: [ 'main' ]
   pull_request:
     branches: [ '**' ]
   workflow_dispatch:
@@ -13,7 +13,7 @@ env:
 
 jobs:
   test-nightly:
-    name: Test
+    name: Test (${{ contains(matrix.runs-on, 'arm') && 'AArch64' || 'x86_64'}}, ${{ matrix.container }})
 
     strategy:
       matrix:
@@ -21,6 +21,7 @@ jobs:
           - ubuntu-latest
           - ubuntu-24.04-arm
         container:
+          - 'ubuntu:22.04'
           - 'ubuntu:latest'
           - 'ubuntu:rolling'
           - 'opensuse/tumbleweed:latest'
@@ -37,13 +38,10 @@ jobs:
       - run: echo "ARCH=aarch64" >> $GITHUB_ENV
         if: ${{ runner.arch == 'ARM64' }}
       - run: apt-get update && apt-get -y install gcc g++ clang lld curl bubblewrap
-        if: ${{ contains(matrix.container, 'ubuntu') }}
-      - run: su ubuntu && cd ~
-        if: ${{ contains(matrix.container, 'ubuntu') }}
+        if: ${{ contains(matrix.container, 'ubuntu') }}      
       - run: zypper in -y gcc gcc-c++ glibc-devel-static clang lld curl rustup bubblewrap
         if: ${{ contains(matrix.container, 'opensuse') }}
       - run: useradd -m -g users user && su user && cd ~
-        if: ${{ contains(matrix.container, 'opensuse') }}
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         id: rust-toolchain
@@ -61,7 +59,7 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.container }}-${{ matrix.runs-on }}-cargo-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo build --profile ci --workspace --no-default-features
       - run: cargo test --profile ci --workspace
-        if: ${{ runner.arch == 'X86' }}
+        if: ${{ runner.arch == 'X64' }}
       # TODO: AArch64 test suite is not green yet
       - run: cargo test --profile ci --workspace || true
         if: ${{ runner.arch == 'ARM64' }}

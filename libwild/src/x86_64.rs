@@ -5,7 +5,6 @@
 
 use crate::arch::Arch;
 use crate::args::OutputKind;
-use crate::elf::DynamicRelocationKind;
 use crate::elf::RelocationKindInfo;
 use crate::elf::RelocationSize;
 use crate::elf::PLT_ENTRY_SIZE;
@@ -14,6 +13,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use linker_utils::elf::shf;
 use linker_utils::elf::x86_64_rel_type_to_string;
+use linker_utils::elf::DynamicRelocationKind;
 use linker_utils::elf::SectionFlags;
 use linker_utils::relaxation::RelocationModifier;
 use linker_utils::x86_64::RelaxationKind;
@@ -53,16 +53,7 @@ impl crate::arch::Arch for X86_64 {
     }
 
     fn get_dynamic_relocation_type(relocation: DynamicRelocationKind) -> u32 {
-        match relocation {
-            DynamicRelocationKind::Copy => object::elf::R_X86_64_COPY,
-            DynamicRelocationKind::Irelative => object::elf::R_X86_64_IRELATIVE,
-            DynamicRelocationKind::DtpMod => object::elf::R_X86_64_DTPMOD64,
-            DynamicRelocationKind::DtpOff => object::elf::R_X86_64_DTPOFF64,
-            DynamicRelocationKind::TpOff => object::elf::R_X86_64_TPOFF64,
-            DynamicRelocationKind::Relative => object::elf::R_X86_64_RELATIVE,
-            DynamicRelocationKind::DynamicSymbol => object::elf::R_X86_64_GLOB_DAT,
-            DynamicRelocationKind::TlsDesc => object::elf::R_X86_64_TLSDESC,
-        }
+        relocation.x86_64_r_type()
     }
 
     fn write_plt_entry(
@@ -115,7 +106,7 @@ impl crate::arch::Relaxation for Relaxation {
         let is_absolute_address = is_known_address && non_relocatable;
         let can_bypass_got = value_flags.contains(ValueFlags::CAN_BYPASS_GOT);
 
-        // IFuncs cannot be referenced directly. The always need to go via the GOT. So if we've got
+        // IFuncs cannot be referenced directly. They always need to go via the GOT. So if we've got
         // say a PLT32 relocation, we don't want to relax it even if we're in a static executable.
         // Furthermore, if we encounter a relocation like PC32 to an ifunc, then we need to change
         // it so that it goes via the GOT. This is kind of the opposite of relaxation.
@@ -145,23 +136,29 @@ impl crate::arch::Relaxation for Relaxation {
                 }
                 let b1 = section_bytes[offset - 2];
                 let rex = section_bytes[offset - 3];
+
+                // REX prefixed instruction with W=1, R=0/1, X=0, B=0
                 if rex != 0x48 && rex != 0x4c {
                     return None;
                 }
+
                 if is_absolute || is_absolute_address {
                     match b1 {
+                        // mov *x(%rip), reg
                         0x8b => {
                             return create(
                                 RelaxationKind::RexMovIndirectToAbsolute,
                                 object::elf::R_X86_64_32,
                             );
                         }
+                        // sub *x(%rip), reg
                         0x2b => {
                             return create(
                                 RelaxationKind::RexSubIndirectToAbsolute,
                                 object::elf::R_X86_64_32,
                             );
                         }
+                        // cmp *x(%rip), reg
                         0x3b => {
                             return create(
                                 RelaxationKind::RexCmpIndirectToAbsolute,
@@ -172,6 +169,7 @@ impl crate::arch::Relaxation for Relaxation {
                     }
                 } else if can_bypass_got {
                     match b1 {
+                        // mov *x(%rip), reg
                         0x8b => {
                             return create(
                                 RelaxationKind::MovIndirectToLea,
@@ -183,22 +181,36 @@ impl crate::arch::Relaxation for Relaxation {
                 }
             }
             object::elf::R_X86_64_GOTPCRELX => {
-                if is_absolute || is_absolute_address {
-                    match section_bytes.get(offset - 2)? {
-                        0x8b => {
+                match section_bytes.get(offset - 2)? {
+                    // mov *x(%rip), reg
+                    0x8b => {
+                        if is_absolute || is_absolute_address {
                             return create(
                                 RelaxationKind::MovIndirectToAbsolute,
                                 object::elf::R_X86_64_32,
                             );
+                        } else if can_bypass_got {
+                            return create(
+                                RelaxationKind::MovIndirectToLea,
+                                object::elf::R_X86_64_PC32,
+                            );
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
                 if can_bypass_got {
                     match section_bytes.get(offset - 2..offset)? {
+                        // call *x(%rip)
                         [0xff, 0x15] => {
                             return create(
                                 RelaxationKind::CallIndirectToRelative,
+                                object::elf::R_X86_64_PC32,
+                            )
+                        }
+                        // jmp *x(%rip)
+                        [0xff, 0x25] => {
+                            return create(
+                                RelaxationKind::JmpIndirectToRelative,
                                 object::elf::R_X86_64_PC32,
                             )
                         }
@@ -209,6 +221,7 @@ impl crate::arch::Relaxation for Relaxation {
             }
             object::elf::R_X86_64_GOTPCREL if can_bypass_got && offset >= 2 => {
                 match section_bytes.get(offset - 2)? {
+                    // mov *x(%rip), reg
                     0x8b => {
                         return create(
                             RelaxationKind::MovIndirectToLea,
@@ -221,6 +234,7 @@ impl crate::arch::Relaxation for Relaxation {
             }
             object::elf::R_X86_64_GOTTPOFF if can_bypass_got => {
                 match section_bytes.get(offset - 3..offset - 1)? {
+                    // mov *x(%rip), reg
                     [0x48 | 0x4c, 0x8b] => {
                         return create(
                             RelaxationKind::RexMovIndirectToAbsolute,
@@ -254,6 +268,7 @@ impl crate::arch::Relaxation for Relaxation {
                 return create(kind, object::elf::R_X86_64_GOTTPOFF);
             }
             object::elf::R_X86_64_TLSLD if output_kind.is_executable() => {
+                // lea    0x0(%rip),%rdi
                 if section_bytes.get(offset - 3..offset)? == [0x48, 0x8d, 0x3d] {
                     if section_bytes.get(offset + 4..offset + 6) == Some(&[0x48, 0xb8]) {
                         // The previous instruction was 64 bit, so we use a slightly different
@@ -266,12 +281,23 @@ impl crate::arch::Relaxation for Relaxation {
                     return create(RelaxationKind::TlsLdToLocalExec, object::elf::R_X86_64_NONE);
                 }
             }
+            object::elf::R_X86_64_GOTPC32_TLSDESC
+                if can_bypass_got && output_kind.is_static_executable() =>
+            {
+                // lea    0x0(%rip),%rax
+                if section_bytes.get(offset - 3..offset)? == [0x48, 0x8d, 0x05] {
+                    return create(
+                        RelaxationKind::TlsDescToLocalExec,
+                        object::elf::R_X86_64_TPOFF32,
+                    );
+                }
+            }
             _ => return None,
         };
         None
     }
 
-    fn apply(&self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut u64) {
+    fn apply(&self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut i64) {
         self.kind.apply(section_bytes, offset_in_section, addend);
     }
 
@@ -295,18 +321,26 @@ enum TlsGdForm {
 
 impl TlsGdForm {
     fn identify(bytes: &[u8], offset: usize) -> Option<Self> {
+        // data16 lea 0x0(%rip),%rdi
+        // data16 data16 rex.W call {relative function offset}
         if bytes.get(offset - 4..offset) == Some(&[0x66, 0x48, 0x8d, 0x3d])
             && bytes.get(offset + 4..offset + 8) == Some(&[0x66, 0x66, 0x48, 0xe8])
         {
-            Some(Self::Regular)
-        } else if bytes.get(offset - 3..offset) == Some(&[0x48, 0x8d, 0x3d])
+            return Some(Self::Regular);
+        }
+
+        // lea 0x0(%rip),%rdi
+        // movabs $X,%rax
+        // TODO: This branch is not currently exercised by our tests. Add a test and document the
+        // third instruction.
+        if bytes.get(offset - 3..offset) == Some(&[0x48, 0x8d, 0x3d])
             && bytes.get(offset + 4..offset + 6) == Some(&[0x48, 0xb8])
             && bytes.get(offset + 14..offset + 19) == Some(&[0x48, 0x01, 0xd8, 0xff, 0xd0])
         {
-            Some(Self::Large)
-        } else {
-            None
+            return Some(Self::Large);
         }
+
+        None
     }
 }
 
