@@ -561,7 +561,7 @@ fn populate_file_header<S: StorageModel, A: Arch>(
     header.e_ident.class = object::elf::ELFCLASS64;
     header.e_ident.data = object::elf::ELFDATA2LSB; // Little endian
     header.e_ident.version = 1;
-    header.e_ident.os_abi = object::elf::ELFOSABI_NONE;
+    header.e_ident.os_abi = object::elf::ELFOSABI_FREEBSD;
     header.e_ident.abi_version = 0;
     header.e_ident.padding = Default::default();
     header.e_type.set(e, ty);
