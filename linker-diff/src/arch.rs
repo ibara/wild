@@ -1,12 +1,13 @@
+use linker_utils::elf::BitMask;
 use linker_utils::elf::DynamicRelocationKind;
-use linker_utils::elf::RelocationKind;
+use linker_utils::elf::RelocationKindInfo;
 use linker_utils::relaxation::RelocationModifier;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::ops::Range;
 
 /// Provides architecture-specific functionality needed by linker-diff.
-pub(crate) trait Arch: Clone + Copy + Eq + PartialEq {
+pub(crate) trait Arch: Clone + Copy + Eq + PartialEq + Debug {
     /// The type of relocations on this architecture.
     type RType: RType;
 
@@ -15,6 +16,12 @@ pub(crate) trait Arch: Clone + Copy + Eq + PartialEq {
 
     /// A type representing a decoded instruction on this architecture.
     type RawInstruction: Copy + Clone;
+
+    /// The maximum number of bytes prior to a relocation offset that a relaxation might modify.
+    const MAX_RELAX_MODIFY_BEFORE: u64;
+
+    /// The maximum number of bytes after a relocation offset that a relaxation might modify.
+    const MAX_RELAX_MODIFY_AFTER: u64;
 
     /// Calls `cb` with each relaxation that we think is possible for the supplied relocation type and
     /// section kind.
@@ -25,7 +32,35 @@ pub(crate) trait Arch: Clone + Copy + Eq + PartialEq {
     );
 
     /// Returns a mask that can be used to identify the supplied relaxation.
-    fn relaxation_mask(relaxation: Relaxation<Self>) -> RelaxationMask;
+    fn relaxation_mask(relaxation: Relaxation<Self>, relocation_offset: usize) -> RelaxationMask {
+        let byte_range = Self::relaxation_byte_range(relaxation);
+
+        let mut mask = RelaxationMask {
+            offset_shift: byte_range.offset_shift,
+            bitmask: Vec::new(),
+        };
+
+        if let Some(info) = relaxation.new_r_type.relocation_info() {
+            match info.size {
+                linker_utils::elf::RelocationSize::ByteSize(num_bytes) => {
+                    let mask_len = (relocation_offset + num_bytes).max(byte_range.num_bytes);
+
+                    mask.bitmask.resize(mask_len, 0xff);
+
+                    for b in &mut mask.bitmask[relocation_offset..relocation_offset + num_bytes] {
+                        *b = 0;
+                    }
+                }
+                linker_utils::elf::RelocationSize::BitMasking(BitMask { range, instruction }) => {
+                    mask.bitmask = Vec::from(instruction.bit_mask(range));
+                }
+            }
+        }
+
+        mask
+    }
+
+    fn relaxation_byte_range(relaxation: Relaxation<Self>) -> RelaxationByteRange;
 
     /// Applies the supplied relaxation to `section_bytes`, possibly also updating
     /// `offset_in_section` and `addend` according to the relaxation kind.
@@ -41,7 +76,7 @@ pub(crate) trait Arch: Clone + Copy + Eq + PartialEq {
     fn next_relocation_modifier(relaxation_kind: Self::RelaxationKind) -> RelocationModifier;
 
     /// Returns a human readable form of the supplied instruction.
-    fn instruction_to_string(instruction: Self::RawInstruction) -> String;
+    fn instruction_to_string(instruction: &Instruction<Self>) -> String;
 
     /// Decode instructions that are in or overlap with the supplied range. The start of `range` may
     /// be part way through an instruction. For variable length instructions, implementations will
@@ -53,6 +88,8 @@ pub(crate) trait Arch: Clone + Copy + Eq + PartialEq {
         function_offset_in_section: u64,
         range: Range<u64>,
     ) -> Vec<Instruction<Self>>;
+
+    fn decode_plt_entry(plt_entry: &[u8], plt_base: u64, plt_offset: u64) -> Option<PltEntry>;
 }
 
 pub(crate) trait RType: Copy + Debug + Display + Eq + PartialEq {
@@ -60,11 +97,7 @@ pub(crate) trait RType: Copy + Debug + Display + Eq + PartialEq {
 
     fn from_dynamic_relocation_kind(kind: DynamicRelocationKind) -> Self;
 
-    fn relocation_info(self) -> Option<RelocationTypeInfo>;
-
-    fn relocation_num_bytes(self) -> Option<usize> {
-        self.relocation_info().map(|info| info.size_in_bytes)
-    }
+    fn relocation_info(self) -> Option<RelocationKindInfo>;
 
     fn dynamic_relocation_kind(self) -> Option<DynamicRelocationKind>;
 }
@@ -80,16 +113,29 @@ pub(crate) struct Relaxation<A: Arch> {
     pub(crate) new_r_type: A::RType,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RelocationTypeInfo {
-    pub(crate) kind: RelocationKind,
+/// The range of bytes to which a relaxation applies.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelaxationByteRange {
+    /// Number of bytes prior to the offset of the original relocation at which the bitmask starts.
+    pub(crate) offset_shift: u64,
 
-    /// The number of whole or partial bytes that the relocation spans.
-    pub(crate) size_in_bytes: usize,
+    /// Number of bytes covered by this relaxation, including bytes in which the relocation will be
+    /// written.
+    pub(crate) num_bytes: usize,
+}
+
+impl RelaxationByteRange {
+    pub(crate) fn new(offset_shift: u64, num_bytes: usize) -> Self {
+        Self {
+            offset_shift,
+            num_bytes,
+        }
+    }
 }
 
 /// A bitmask used for comparing the bytes produced by a relaxation with the bytes in the actual
 /// file.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RelaxationMask {
     /// Number of bytes prior to the offset of the original relocation at which the bitmask starts.
     pub(crate) offset_shift: u64,
@@ -109,17 +155,10 @@ pub(crate) struct RelaxationMask {
     ///
     /// The mask would be [0xff, 0xff, 0xff] since the first three bytes of the instruction should
     /// be compared in their entirety.
-    pub(crate) bitmask: &'static [u8],
+    pub(crate) bitmask: Vec<u8>,
 }
 
 impl RelaxationMask {
-    pub(crate) fn new(offset_shift: u64, bitmask: &'static [u8]) -> Self {
-        Self {
-            offset_shift,
-            bitmask,
-        }
-    }
-
     /// Returns whether `a` == `b`, ignoring bits where the corresponding bit in our mask is 0.
     pub(crate) fn matches(&self, a: &[u8], b: &[u8]) -> bool {
         assert_eq!(a.len(), b.len());
@@ -136,17 +175,23 @@ impl RelaxationMask {
 pub(crate) struct Instruction<'data, A: Arch> {
     pub(crate) raw_instruction: A::RawInstruction,
 
-    /// The address of the start of the function that contained this instruction.
-    pub(crate) base_address: u64,
-
-    /// The offset of this instruction within the function.
-    pub(crate) offset: u64,
+    /// The address of the instruction.
+    pub(crate) address: u64,
 
     pub(crate) bytes: &'data [u8],
 }
 
 impl<A: Arch> Instruction<'_, A> {
     pub(crate) fn address(&self) -> u64 {
-        self.base_address + self.offset
+        self.address
     }
+}
+
+pub(crate) enum PltEntry {
+    /// The parameter is an address (most likely of a GOT entry) that will be dereferenced by the
+    /// PLT entry then jumped to.
+    DerefJmp(u64),
+
+    /// The parameter is an index into .rela.plt.
+    JumpSlot(u32),
 }

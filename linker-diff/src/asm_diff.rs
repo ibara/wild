@@ -43,6 +43,7 @@ use self::section_map::InputSectionId;
 use self::section_map::SymbolInfo;
 use crate::arch::Arch;
 use crate::arch::Instruction;
+use crate::arch::PltEntry;
 use crate::arch::RType;
 use crate::arch::Relaxation;
 use crate::arch::RelaxationKind;
@@ -64,6 +65,7 @@ use itertools::Itertools as _;
 use linker_utils::elf::secnames::*;
 use linker_utils::elf::DynamicRelocationKind;
 use linker_utils::elf::RelocationKind;
+use linker_utils::elf::RelocationKindInfo;
 use linker_utils::relaxation::RelocationModifier;
 use object::read::elf::ElfSection64;
 use object::read::elf::FileHeader as _;
@@ -172,7 +174,7 @@ fn compare_sections<A: Arch>(
             section_versions,
             layout,
             &mut testers,
-            offset.saturating_sub(MAX_RELAX_MODIFY_BEFORE),
+            offset.saturating_sub(A::MAX_RELAX_MODIFY_BEFORE),
         )?;
 
         let mut orig_trace = TraceOutput::default();
@@ -390,7 +392,13 @@ impl<A: Arch> ExecDiff<'_, A> {
         }
 
         for block in &mut blocks {
-            block.decode_instructions();
+            let mut trace = TraceOutput::default();
+
+            crate::diagnostics::trace_scope(&mut trace, || {
+                block.decode_instructions();
+            });
+
+            block.trace.append(trace);
         }
 
         let maximum_widths = blocks.iter().fold(ColumnWidths::default(), |widths, b| {
@@ -666,7 +674,7 @@ impl<A: Arch> RelocationInstructionBlock<'_, A> {
                 offset += 1;
             }
 
-            let out = A::instruction_to_string(instruction.raw_instruction);
+            let out = A::instruction_to_string(instruction);
 
             let instruction_padding =
                 (maximum_widths.instruction_bytes - instruction.bytes.len()) * 3;
@@ -674,7 +682,7 @@ impl<A: Arch> RelocationInstructionBlock<'_, A> {
             writeln!(f, "{:instruction_padding$}] {}", "", out.purple())?;
 
             if self.relocation_offset >= instruction_offset
-                && self.relocation_offset <= instruction_end
+                && self.relocation_offset < instruction_end
             {
                 let num_spaces = name_width
                     + address_width
@@ -795,7 +803,7 @@ fn write_carets_for_r_type<R: RType>(f: &mut String, r_type: R) -> Result {
 }
 
 fn num_carets_for_r_type<R: RType>(r_type: R) -> usize {
-    let relocation_size = r_type.relocation_num_bytes().unwrap_or(1);
+    let relocation_size = r_type.relocation_info().map_or(1, relocation_num_bytes);
     (relocation_size * 3).saturating_sub(1).max(1)
 }
 
@@ -1100,12 +1108,6 @@ struct RelaxationTester<'data> {
     bin: &'data Binary<'data>,
 }
 
-/// The maximum number of bytes prior to a relocation offset that a relaxation might modify.
-const MAX_RELAX_MODIFY_BEFORE: u64 = 4;
-
-/// The maximum number of bytes after a relocation offset that a relaxation might modify.
-const MAX_RELAX_MODIFY_AFTER: u64 = 19;
-
 impl<'data> RelaxationTester<'data> {
     fn new(
         original_section: &ElfSection64<'data, '_, LittleEndian>,
@@ -1166,9 +1168,9 @@ impl<'data> RelaxationTester<'data> {
 
         let fail = |reason| Ok(MatchResult::Failed(FailedMatch::new(candidate, reason)));
 
-        let mask = A::relaxation_mask(candidate);
+        let relaxation_range = A::relaxation_byte_range(candidate);
 
-        if offset < mask.offset_shift {
+        if offset < relaxation_range.offset_shift {
             // There aren't enough bytes prior to offset in this section for the relaxation to be
             // possible.
             return fail("Not enough bytes prior");
@@ -1180,11 +1182,12 @@ impl<'data> RelaxationTester<'data> {
             .section_bytes
             .context("Attempted to diff section without data")?;
 
-        let mut scratch = [0_u8; (MAX_RELAX_MODIFY_BEFORE + MAX_RELAX_MODIFY_AFTER) as usize];
-        let base_scratch_offset = mask.offset_shift;
+        let mut scratch =
+            vec![0_u8; (A::MAX_RELAX_MODIFY_BEFORE + A::MAX_RELAX_MODIFY_AFTER) as usize];
+        let base_scratch_offset = relaxation_range.offset_shift;
 
         let copy_start = (offset - base_scratch_offset) as usize;
-        let copy_end = copy_start + mask.bitmask.len();
+        let copy_end = copy_start + relaxation_range.num_bytes;
 
         if copy_end > self.original_data.len() {
             return fail("Not enough bytes after");
@@ -1216,6 +1219,8 @@ impl<'data> RelaxationTester<'data> {
             &mut addend,
         );
 
+        let mask = A::relaxation_mask(candidate, scratch_offset as usize);
+
         // Check to see if the resulting bytes match what's in the output section.
         if !mask.matches(scratch, &section_data[copy_start..copy_end]) {
             return fail("Relaxation output didn't match");
@@ -1241,7 +1246,7 @@ impl<'data> RelaxationTester<'data> {
             .relocation_info()
             .context("Unsupported relocation kind")?;
 
-        let end = (offset + relocation_info.size_in_bytes as u64).max(copy_end as u64);
+        let end = (offset + relocation_num_bytes(relocation_info) as u64).max(copy_end as u64);
 
         if rel.kind() == object::RelocationKind::PltRelative {
             // Some relaxations cannot be identified purely by the instruction bytes. For example
@@ -1295,7 +1300,7 @@ impl<'data> RelaxationTester<'data> {
             .get(offset as usize..)
             .context("Invalid relocation offset")?;
 
-        let mut value = match relocation_info.size_in_bytes {
+        let mut value = match relocation_num_bytes(relocation_info) {
             8 => u64::from_le_bytes(
                 *value_bytes
                     .first_chunk::<8>()
@@ -1367,7 +1372,7 @@ impl<'data> RelaxationTester<'data> {
 
         value = value.wrapping_add(relative_to);
 
-        if relocation_info.size_in_bytes == 4 {
+        if relocation_num_bytes(relocation_info) == 4 {
             value = u64::from(value as u32);
         }
 
@@ -1382,7 +1387,7 @@ impl<'data> RelaxationTester<'data> {
                 // sometimes used to select which string in the string merge section we're pointing
                 // at. If we subtracted the addend, then instead of pointing at the correct string,
                 // we'd end up pointing to the start of the string-merge section.
-                value + relocation_info.size_in_bytes as u64
+                value + relocation_num_bytes(relocation_info) as u64
             } else {
                 value
             };
@@ -1405,14 +1410,14 @@ impl<'data> RelaxationTester<'data> {
 
         value = value.wrapping_sub(addend as u64);
 
-        if relocation_info.size_in_bytes == 4 {
+        if relocation_num_bytes(relocation_info) == 4 {
             value = u64::from(value as u32);
         }
 
         let mut reference_props = ReferenceProperties::default();
 
         if is_pointer {
-            if let Some(got_address) = self.bin.address_index.plt_to_got_address(value)? {
+            if let Some(got_address) = self.bin.address_index.plt_to_got_address::<A>(value)? {
                 reference_props.via_plt = true;
 
                 if !self.bin.address_index.is_got_address(got_address) {
@@ -1598,7 +1603,9 @@ impl<'data> RelaxationTester<'data> {
         original_r_type: A::RType,
         failed_matches: Vec<FailedMatch<A>>,
     ) -> Resolution<'data, A> {
-        let relocation_size = original_r_type.relocation_num_bytes().unwrap_or(1);
+        let relocation_size = original_r_type
+            .relocation_info()
+            .map_or(1, relocation_num_bytes);
 
         Resolution {
             relaxation: None,
@@ -1905,24 +1912,32 @@ struct PltIndex<'data> {
 impl PltIndex<'_> {
     /// Returns the address of the GOT entry for the specified PLT address or None if the supplied
     /// address isn't a valid PLT entry in this index.
-    fn lookup_got_address(&self, plt_address: u64, index: &AddressIndex) -> Result<Option<u64>> {
+    fn lookup_got_address<A: Arch>(
+        &self,
+        plt_address: u64,
+        index: &AddressIndex,
+    ) -> Result<Option<u64>> {
         if !(self.plt_base..self.plt_base + self.bytes.len() as u64).contains(&plt_address) {
             return Ok(None);
         }
 
         let offset = plt_address - self.plt_base;
 
-        if offset % self.entry_length != 0 {
+        if self.entry_length != 0 && offset % self.entry_length != 0 {
             bail!(
                 "PLT address 0x{plt_address:x} is not aligned to 0x{:x}",
                 self.entry_length
             );
         }
 
-        let entry_bytes = &self.bytes[offset as usize..(offset + self.entry_length) as usize];
-
-        let plt_entry = PltEntry::decode(entry_bytes, self.plt_base, offset)
-            .context("Unrecognised PLT entry format")?;
+        let plt_entry = if self.entry_length == 0 {
+            // Sometimes linkers don't set the entry size on PLT sections. In that case, we try both
+            // size 8 and if that fails, try size 16.
+            self.decode_plt_entry_with_size::<A>(offset, 8)
+                .or_else(|_| self.decode_plt_entry_with_size::<A>(offset, 16))?
+        } else {
+            self.decode_plt_entry_with_size::<A>(offset, self.entry_length)?
+        };
 
         let got_address = match plt_entry {
             PltEntry::DerefJmp(address) => address,
@@ -1939,6 +1954,16 @@ impl PltIndex<'_> {
         };
 
         Ok(Some(got_address))
+    }
+
+    fn decode_plt_entry_with_size<A: Arch>(
+        &self,
+        offset: u64,
+        entry_size: u64,
+    ) -> Result<PltEntry> {
+        let entry_bytes = &self.bytes[offset as usize..(offset + entry_size) as usize];
+        A::decode_plt_entry(entry_bytes, self.plt_base, offset)
+            .context("Unrecognised PLT entry format")
     }
 }
 
@@ -2099,13 +2124,9 @@ impl<'data> AddressIndex<'data> {
             return Ok(());
         };
 
-        let mut entry_length = section.elf_section_header().sh_entsize(LittleEndian) as usize;
+        let entry_length = section.elf_section_header().sh_entsize(LittleEndian) as usize;
 
-        if entry_length == 0 {
-            entry_length = detect_plt_entry_size(bytes);
-        }
-
-        if ![8, 0x10].contains(&entry_length) {
+        if ![0, 8, 0x10].contains(&entry_length) {
             bail!("{section_name} has unrecognised entry length {entry_length}");
         }
 
@@ -2199,10 +2220,10 @@ impl<'data> AddressIndex<'data> {
             });
     }
 
-    fn plt_to_got_address(&self, plt_address: u64) -> Result<Option<u64>> {
+    fn plt_to_got_address<A: Arch>(&self, plt_address: u64) -> Result<Option<u64>> {
         self.plt_indexes
             .iter()
-            .find_map(|index| index.lookup_got_address(plt_address, self).transpose())
+            .find_map(|index| index.lookup_got_address::<A>(plt_address, self).transpose())
             .transpose()
     }
 
@@ -2332,154 +2353,6 @@ fn is_relocatable(elf_file: &ElfFile64) -> bool {
     elf_file.elf_header().e_type(LittleEndian) == object::elf::ET_DYN
 }
 
-/// Sometimes linkers don't set the entry size on PLT sections. In that case, we try to decode the
-/// first few entries assuming both size 8 and size 16, then return whichever size decodes the most
-/// successfully.
-fn detect_plt_entry_size(bytes: &[u8]) -> usize {
-    fn try_size(bytes: &[u8], entry_length: usize) -> usize {
-        bytes
-            .chunks(entry_length)
-            .take(10)
-            .filter_map(|chunk| PltEntry::decode(chunk, 0, 0))
-            .count()
-    }
-
-    let count_8 = try_size(bytes, 8);
-    let count_16 = try_size(bytes, 16);
-    if count_8 > count_16 {
-        8
-    } else {
-        16
-    }
-}
-
-enum PltEntry {
-    /// The parameter is an address (most likely of a GOT entry) that will be dereferenced by the
-    /// PLT entry then jumped to.
-    DerefJmp(u64),
-
-    /// The parameter is an index into .rela.plt.
-    JumpSlot(u32),
-}
-
-impl PltEntry {
-    fn decode(plt_entry: &[u8], plt_base: u64, plt_offset: u64) -> Option<PltEntry> {
-        match plt_entry.len() {
-            8 => Self::decode_8(plt_entry, plt_base, plt_offset),
-            16 => Self::decode_16(plt_entry, plt_base, plt_offset),
-            _ => None,
-        }
-    }
-
-    fn decode_8(plt_entry: &[u8], plt_base: u64, plt_offset: u64) -> Option<PltEntry> {
-        const RIP_OFFSET: usize = 6;
-        // jmp *{relative GOT}(%rip)
-        // xchg %ax, %ax
-        if plt_entry.starts_with(&[0xff, 0x25]) && plt_entry.ends_with(&[0x66, 0x90]) {
-            let offset = u64::from(u32::from_le_bytes(
-                *plt_entry[RIP_OFFSET - 4..].first_chunk::<4>().unwrap(),
-            ));
-            return Some(PltEntry::DerefJmp(
-                (plt_base + plt_offset + RIP_OFFSET as u64).wrapping_add(offset),
-            ));
-        }
-        None
-    }
-
-    fn decode_16(plt_entry: &[u8], plt_base: u64, plt_offset: u64) -> Option<PltEntry> {
-        // TODO: We should perhaps report differences in which PLT template was used.
-        const PLT_ENTRY_LENGTH: usize = 0x10;
-        {
-            const PLT_ENTRY_TEMPLATE: &[u8; PLT_ENTRY_LENGTH] = &[
-                0xf3, 0x0f, 0x1e, 0xfa, // endbr64
-                0xf2, 0xff, 0x25, 0x0, 0x0, 0x0, 0x0, // bnd jmp *{relative GOT address}(%rip)
-                0x0f, 0x1f, 0x44, 0x0, 0x0, // nopl   0x0(%rax,%rax,1)
-            ];
-
-            if plt_entry[..7] == PLT_ENTRY_TEMPLATE[..7] {
-                // The offset of the instruction pointer when the jmp instruction is processed -
-                // i.e. the start of the next instruction after the jmp instruction.
-                const RIP_OFFSET: usize = 11;
-                let offset = u64::from(u32::from_le_bytes(
-                    *plt_entry[RIP_OFFSET - 4..].first_chunk::<4>().unwrap(),
-                ));
-                return Some(PltEntry::DerefJmp(
-                    (plt_base + plt_offset + RIP_OFFSET as u64).wrapping_add(offset),
-                ));
-            }
-        }
-
-        {
-            const PLT_ENTRY_TEMPLATE: &[u8; PLT_ENTRY_LENGTH] = &[
-                0xf3, 0x0f, 0x1e, 0xfa, // endbr64
-                0x68, 0, 0, 0, 0, // push $0
-                0xf2, 0xe9, 0, 0, 0, 0,    // bnd jmp {plt[0]}(%rip)
-                0x90, // nop
-            ];
-            // Note: Some variants use jmp instead of bnd jmp, then a different padding instruction.
-            // Because we use the index that gets pushed, we ignore the bytes of the later
-            // instructions, so that we support these variants.
-            if plt_entry[..5] == PLT_ENTRY_TEMPLATE[..5] {
-                let index = u32::from_le_bytes(*plt_entry[5..].first_chunk::<4>().unwrap());
-                return Some(PltEntry::JumpSlot(index));
-            }
-        }
-
-        {
-            const PLT_ENTRY_TEMPLATE: &[u8; PLT_ENTRY_LENGTH] = &[
-                0xff, 0x25, 0, 0, 0, 0, // jmp *{relative GOT address}(%rip)
-                0x68, 0, 0, 0, 0, // push $0
-                0xe9, 0, 0, 0, 0, // jmp {plt[0]}(%rip)
-            ];
-            if plt_entry[..2] == PLT_ENTRY_TEMPLATE[..2]
-                && plt_entry[6] == PLT_ENTRY_TEMPLATE[6]
-                && plt_entry[11] == PLT_ENTRY_TEMPLATE[11]
-            {
-                // The offset of the instruction pointer when the jmp instruction is processed -
-                // i.e. the start of the next instruction after the jmp instruction.
-                const RIP_OFFSET: usize = 6;
-                let offset = u64::from(u32::from_le_bytes(
-                    *plt_entry[RIP_OFFSET - 4..].first_chunk::<4>().unwrap(),
-                ));
-                return Some(PltEntry::DerefJmp(
-                    (plt_base + plt_offset + RIP_OFFSET as u64).wrapping_add(offset),
-                ));
-            }
-        }
-
-        {
-            const PLT_ENTRY_TEMPLATE: &[u8; PLT_ENTRY_LENGTH] = &[
-                0x41, 0xbb, 0, 0, 0, 0, // mov $X, %r11d
-                0xff, 0x25, 0, 0, 0, 0, // jmp indirect relative
-                0xcc, 0xcc, 0xcc, 0xcc, // int3 x 4
-            ];
-            if plt_entry[..2] == PLT_ENTRY_TEMPLATE[..2]
-                && plt_entry[6..8] == PLT_ENTRY_TEMPLATE[6..8]
-                && plt_entry[12..16] == PLT_ENTRY_TEMPLATE[12..16]
-            {
-                const RIP_OFFSET: usize = 12;
-                let offset = u64::from(u32::from_le_bytes(
-                    *plt_entry[RIP_OFFSET - 4..].first_chunk::<4>().unwrap(),
-                ));
-                return Some(PltEntry::DerefJmp(
-                    (plt_base + plt_offset + RIP_OFFSET as u64).wrapping_add(offset),
-                ));
-            }
-        }
-
-        // endbr, jmp indirect relative
-        let prefix = &[0xf3, 0x0f, 0x1e, 0xfa, 0xff, 0x25];
-        if let Some(rest) = plt_entry.strip_prefix(prefix) {
-            let offset = u64::from(u32::from_le_bytes(*rest.first_chunk::<4>().unwrap()));
-            return Some(PltEntry::DerefJmp(
-                (plt_base + plt_offset + prefix.len() as u64 + 4).wrapping_add(offset),
-            ));
-        }
-
-        None
-    }
-}
-
 /// Attempts to read some data starting at `address` up to the end of the segment.
 fn read_segment<'data>(elf_file: &ElfFile64<'data>, address: u64) -> Option<Data<'data>> {
     // This could well end up needing to be optimised if we end up caring about performance.
@@ -2580,6 +2453,15 @@ impl BinAttributes {
                 "shared-object"
             }
             (OutputKind::SharedObject, _, _) => "invalid-shared-object",
+        }
+    }
+}
+
+fn relocation_num_bytes(info: RelocationKindInfo) -> usize {
+    match info.size {
+        linker_utils::elf::RelocationSize::ByteSize(b) => b,
+        linker_utils::elf::RelocationSize::BitMasking(mask) => {
+            (mask.range.end.div_ceil(8) - mask.range.start / 8) as usize
         }
     }
 }

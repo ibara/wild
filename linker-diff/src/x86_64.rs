@@ -1,19 +1,21 @@
 use crate::arch::Arch;
 use crate::arch::Instruction;
+use crate::arch::PltEntry;
 use crate::arch::RType as _;
 use crate::arch::Relaxation;
-use crate::arch::RelaxationMask;
-use crate::arch::RelocationTypeInfo;
+use crate::arch::RelaxationByteRange;
 use iced_x86::Formatter as _;
 use linker_utils::elf::x86_64_rel_type_to_string;
 use linker_utils::elf::DynamicRelocationKind;
+use linker_utils::elf::RelocationKindInfo;
+use linker_utils::utils::u32_from_slice;
 use linker_utils::x86_64::RelaxationKind;
 use object::SectionKind;
 use std::fmt::Display;
 
 const BIT_CLASS: u32 = 64;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct X86_64;
 
 impl Arch for X86_64 {
@@ -23,42 +25,37 @@ impl Arch for X86_64 {
 
     type RawInstruction = iced_x86::Instruction;
 
+    const MAX_RELAX_MODIFY_BEFORE: u64 = 4;
+    const MAX_RELAX_MODIFY_AFTER: u64 = 19;
+
     fn next_relocation_modifier(
         relaxation_kind: Self::RelaxationKind,
     ) -> linker_utils::relaxation::RelocationModifier {
         relaxation_kind.next_modifier()
     }
 
-    fn relaxation_mask(relaxation: Relaxation<Self>) -> crate::arch::RelaxationMask {
+    fn relaxation_byte_range(relaxation: Relaxation<Self>) -> RelaxationByteRange {
         match relaxation.relaxation_kind {
-            Self::RelaxationKind::MovIndirectToLea => RelaxationMask::new(2, &[0xff; 2]),
-            Self::RelaxationKind::MovIndirectToAbsolute => RelaxationMask::new(2, &[0xff; 2]),
-            Self::RelaxationKind::RexMovIndirectToAbsolute => RelaxationMask::new(3, &[0xff; 3]),
-            Self::RelaxationKind::RexSubIndirectToAbsolute => RelaxationMask::new(3, &[0xff; 3]),
-            Self::RelaxationKind::RexCmpIndirectToAbsolute => RelaxationMask::new(3, &[0xff; 3]),
-            Self::RelaxationKind::CallIndirectToRelative => RelaxationMask::new(2, &[0xff; 2]),
-            Self::RelaxationKind::JmpIndirectToRelative => {
-                RelaxationMask::new(2, &[0xff, 0, 0, 0, 0, 0xff])
-            }
-            Self::RelaxationKind::TlsGdToLocalExec => RelaxationMask::new(4, &[0xff; 12]),
-            Self::RelaxationKind::TlsGdToLocalExecLarge => RelaxationMask::new(
-                3,
-                &[
-                    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0,
-                    0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                ],
-            ),
-            Self::RelaxationKind::TlsGdToInitialExec => RelaxationMask::new(4, &[0xff; 12]),
-            Self::RelaxationKind::TlsLdToLocalExec => RelaxationMask::new(3, &[0xff; 12]),
-            Self::RelaxationKind::TlsLdToLocalExec64 => RelaxationMask::new(3, &[0xff; 18]),
-            Self::RelaxationKind::SkipTlsDescCall => RelaxationMask::new(0, &[0xff; 2]),
-            Self::RelaxationKind::TlsDescToLocalExec => RelaxationMask::new(3, &[0xff; 3]),
+            Self::RelaxationKind::MovIndirectToLea => RelaxationByteRange::new(2, 6),
+            Self::RelaxationKind::MovIndirectToAbsolute => RelaxationByteRange::new(2, 6),
+            Self::RelaxationKind::RexMovIndirectToAbsolute => RelaxationByteRange::new(3, 7),
+            Self::RelaxationKind::RexSubIndirectToAbsolute => RelaxationByteRange::new(3, 7),
+            Self::RelaxationKind::RexCmpIndirectToAbsolute => RelaxationByteRange::new(3, 7),
+            Self::RelaxationKind::CallIndirectToRelative => RelaxationByteRange::new(2, 6),
+            Self::RelaxationKind::JmpIndirectToRelative => RelaxationByteRange::new(2, 6),
+            Self::RelaxationKind::TlsGdToLocalExec => RelaxationByteRange::new(4, 16),
+            Self::RelaxationKind::TlsGdToLocalExecLarge => RelaxationByteRange::new(3, 22),
+            Self::RelaxationKind::TlsGdToInitialExec => RelaxationByteRange::new(4, 16),
+            Self::RelaxationKind::TlsLdToLocalExec => RelaxationByteRange::new(3, 12),
+            Self::RelaxationKind::TlsLdToLocalExec64 => RelaxationByteRange::new(3, 22),
+            Self::RelaxationKind::SkipTlsDescCall => RelaxationByteRange::new(0, 2),
+            Self::RelaxationKind::TlsDescToLocalExec => RelaxationByteRange::new(3, 7),
             Self::RelaxationKind::NoOp => match relaxation.new_r_type.0 {
                 // TLSDESC_CALL is a relocation that does nothing unless it's optimised away. To
                 // verify that it hasn't been optimised away, we need to make sure that we compare
                 // the bytes immediately after the relocation.
-                object::elf::R_X86_64_TLSDESC_CALL => RelaxationMask::new(0, &[0xff; 2]),
-                _ => RelaxationMask::new(0, &[]),
+                object::elf::R_X86_64_TLSDESC_CALL => RelaxationByteRange::new(0, 2),
+                _ => RelaxationByteRange::new(0, 0),
             },
         }
     }
@@ -201,11 +198,124 @@ impl Arch for X86_64 {
         instructions
     }
 
-    fn instruction_to_string(instruction: Self::RawInstruction) -> String {
+    fn instruction_to_string(instruction: &Instruction<Self>) -> String {
         let mut out = String::new();
         let mut formatter = iced_x86::GasFormatter::new();
-        formatter.format(&instruction, &mut out);
+        formatter.format(&instruction.raw_instruction, &mut out);
         out
+    }
+
+    fn decode_plt_entry(
+        plt_entry: &[u8],
+        plt_base: u64,
+        plt_offset: u64,
+    ) -> Option<crate::arch::PltEntry> {
+        return match plt_entry.len() {
+            8 => decode_8(plt_entry, plt_base, plt_offset),
+            16 => decode_16(plt_entry, plt_base, plt_offset),
+            _ => None,
+        };
+
+        fn decode_8(plt_entry: &[u8], plt_base: u64, plt_offset: u64) -> Option<PltEntry> {
+            const RIP_OFFSET: usize = 6;
+            // jmp *{relative GOT}(%rip)
+            // xchg %ax, %ax
+            if plt_entry.starts_with(&[0xff, 0x25]) && plt_entry.ends_with(&[0x66, 0x90]) {
+                let offset = u64::from(u32_from_slice(&plt_entry[RIP_OFFSET - 4..]));
+                return Some(PltEntry::DerefJmp(
+                    (plt_base + plt_offset + RIP_OFFSET as u64).wrapping_add(offset),
+                ));
+            }
+            None
+        }
+
+        fn decode_16(plt_entry: &[u8], plt_base: u64, plt_offset: u64) -> Option<PltEntry> {
+            // TODO: We should perhaps report differences in which PLT template was used.
+            const PLT_ENTRY_LENGTH: usize = 0x10;
+            {
+                const PLT_ENTRY_TEMPLATE: &[u8; PLT_ENTRY_LENGTH] = &[
+                    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                    0xf2, 0xff, 0x25, 0x0, 0x0, 0x0,
+                    0x0, // bnd jmp *{relative GOT address}(%rip)
+                    0x0f, 0x1f, 0x44, 0x0, 0x0, // nopl   0x0(%rax,%rax,1)
+                ];
+
+                if plt_entry[..7] == PLT_ENTRY_TEMPLATE[..7] {
+                    // The offset of the instruction pointer when the jmp instruction is processed -
+                    // i.e. the start of the next instruction after the jmp instruction.
+                    const RIP_OFFSET: usize = 11;
+                    let offset = u64::from(u32_from_slice(&plt_entry[RIP_OFFSET - 4..]));
+                    return Some(PltEntry::DerefJmp(
+                        (plt_base + plt_offset + RIP_OFFSET as u64).wrapping_add(offset),
+                    ));
+                }
+            }
+
+            {
+                const PLT_ENTRY_TEMPLATE: &[u8; PLT_ENTRY_LENGTH] = &[
+                    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                    0x68, 0, 0, 0, 0, // push $0
+                    0xf2, 0xe9, 0, 0, 0, 0,    // bnd jmp {plt[0]}(%rip)
+                    0x90, // nop
+                ];
+                // Note: Some variants use jmp instead of bnd jmp, then a different padding instruction.
+                // Because we use the index that gets pushed, we ignore the bytes of the later
+                // instructions, so that we support these variants.
+                if plt_entry[..5] == PLT_ENTRY_TEMPLATE[..5] {
+                    let index = u32_from_slice(&plt_entry[5..]);
+                    return Some(PltEntry::JumpSlot(index));
+                }
+            }
+
+            {
+                const PLT_ENTRY_TEMPLATE: &[u8; PLT_ENTRY_LENGTH] = &[
+                    0xff, 0x25, 0, 0, 0, 0, // jmp *{relative GOT address}(%rip)
+                    0x68, 0, 0, 0, 0, // push $0
+                    0xe9, 0, 0, 0, 0, // jmp {plt[0]}(%rip)
+                ];
+                if plt_entry[..2] == PLT_ENTRY_TEMPLATE[..2]
+                    && plt_entry[6] == PLT_ENTRY_TEMPLATE[6]
+                    && plt_entry[11] == PLT_ENTRY_TEMPLATE[11]
+                {
+                    // The offset of the instruction pointer when the jmp instruction is processed -
+                    // i.e. the start of the next instruction after the jmp instruction.
+                    const RIP_OFFSET: usize = 6;
+                    let offset = u64::from(u32_from_slice(&plt_entry[RIP_OFFSET - 4..]));
+                    return Some(PltEntry::DerefJmp(
+                        (plt_base + plt_offset + RIP_OFFSET as u64).wrapping_add(offset),
+                    ));
+                }
+            }
+
+            {
+                const PLT_ENTRY_TEMPLATE: &[u8; PLT_ENTRY_LENGTH] = &[
+                    0x41, 0xbb, 0, 0, 0, 0, // mov $X, %r11d
+                    0xff, 0x25, 0, 0, 0, 0, // jmp indirect relative
+                    0xcc, 0xcc, 0xcc, 0xcc, // int3 x 4
+                ];
+                if plt_entry[..2] == PLT_ENTRY_TEMPLATE[..2]
+                    && plt_entry[6..8] == PLT_ENTRY_TEMPLATE[6..8]
+                    && plt_entry[12..16] == PLT_ENTRY_TEMPLATE[12..16]
+                {
+                    const RIP_OFFSET: usize = 12;
+                    let offset = u64::from(u32_from_slice(&plt_entry[RIP_OFFSET - 4..]));
+                    return Some(PltEntry::DerefJmp(
+                        (plt_base + plt_offset + RIP_OFFSET as u64).wrapping_add(offset),
+                    ));
+                }
+            }
+
+            // endbr, jmp indirect relative
+            let prefix = &[0xf3, 0x0f, 0x1e, 0xfa, 0xff, 0x25];
+            if let Some(rest) = plt_entry.strip_prefix(prefix) {
+                let offset = u64::from(u32_from_slice(rest));
+                return Some(PltEntry::DerefJmp(
+                    (plt_base + plt_offset + prefix.len() as u64 + 4).wrapping_add(offset),
+                ));
+            }
+
+            None
+        }
     }
 }
 
@@ -242,8 +352,7 @@ impl<'data> AsmDecoder<'data> {
         let next_offset = self.instruction_decoder.position();
         let bytes = &self.bytes[offset..next_offset];
         Some(Instruction {
-            base_address: self.base_address,
-            offset: offset as u64,
+            address: self.base_address + offset as u64,
             raw_instruction: instruction,
             bytes,
         })
@@ -262,11 +371,12 @@ impl crate::arch::RType for RType {
         Self::from_raw(kind.x86_64_r_type())
     }
 
-    fn relocation_info(self) -> Option<RelocationTypeInfo> {
+    fn relocation_info(self) -> Option<RelocationKindInfo> {
         linker_utils::x86_64::relocation_kind_and_size(self.0).map(|(kind, size_in_bytes)| {
-            RelocationTypeInfo {
+            RelocationKindInfo {
                 kind,
-                size_in_bytes,
+                size: linker_utils::elf::RelocationSize::ByteSize(size_in_bytes),
+                mask: None,
             }
         })
     }

@@ -389,33 +389,6 @@ impl SectionType {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use object::elf::*;
-
-    #[test]
-    fn test_rel_type_to_string() {
-        assert_eq!(
-            &x86_64_rel_type_to_string(R_X86_64_32),
-            stringify!(R_X86_64_32)
-        );
-        assert_eq!(
-            &x86_64_rel_type_to_string(R_X86_64_GOTPC32_TLSDESC),
-            stringify!(R_X86_64_GOTPC32_TLSDESC)
-        );
-        assert_eq!(
-            &x86_64_rel_type_to_string(64),
-            "Unknown x86_64 relocation type 0x40"
-        );
-
-        assert_eq!(
-            &aarch64_rel_type_to_string(64),
-            "Unknown aarch64 relocation type 0x40"
-        );
-    }
-}
-
 pub mod secnames {
     pub const FILEHEADER_SECTION_NAME_STR: &str = "";
     pub const FILEHEADER_SECTION_NAME: &[u8] = FILEHEADER_SECTION_NAME_STR.as_bytes();
@@ -640,5 +613,164 @@ impl DynamicRelocationKind {
             DynamicRelocationKind::TlsDesc => object::elf::R_X86_64_TLSDESC,
             DynamicRelocationKind::JumpSlot => object::elf::R_X86_64_JUMP_SLOT,
         }
+    }
+
+    #[must_use]
+    pub fn aarch64_r_type(&self) -> u32 {
+        match self {
+            DynamicRelocationKind::Copy => object::elf::R_AARCH64_COPY,
+            DynamicRelocationKind::Irelative => object::elf::R_AARCH64_IRELATIVE,
+            DynamicRelocationKind::DtpMod => object::elf::R_AARCH64_TLS_DTPMOD,
+            DynamicRelocationKind::DtpOff => object::elf::R_AARCH64_TLS_DTPREL,
+            DynamicRelocationKind::TpOff => object::elf::R_AARCH64_TLS_TPREL,
+            DynamicRelocationKind::Relative => object::elf::R_AARCH64_RELATIVE,
+            DynamicRelocationKind::DynamicSymbol => object::elf::R_AARCH64_GLOB_DAT,
+            DynamicRelocationKind::TlsDesc => object::elf::R_AARCH64_TLSDESC,
+            DynamicRelocationKind::JumpSlot => object::elf::R_AARCH64_JUMP_SLOT,
+        }
+    }
+}
+
+// Half-opened range bounded inclusively below and exclusively above: [`start``, `end`)
+#[derive(Clone, Debug, Copy)]
+pub struct BitRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Clone, Debug, Copy)]
+pub enum RelocationInstruction {
+    Adr,
+    Movkz,
+    Movnz,
+    Ldr,
+    LdrRegister,
+    Add,
+    LdSt,
+    TstBr,
+    Bcond,
+    JumpCall,
+}
+
+impl RelocationInstruction {
+    #[must_use]
+    pub fn bit_mask(&self, range: BitRange) -> [u8; 4] {
+        let mut mask = [0; 4];
+
+        // To figure out which bits are part of the relocation, we write a value with
+        // all ones into a buffer that initially contains zeros.
+        let all_ones = (1 << (range.end - range.start)) - 1;
+        self.write_to_value(all_ones, false, &mut mask);
+
+        // Wherever we get a 1 is part of the relocation, so invert all bits.
+        for b in &mut mask {
+            *b = !*b;
+        }
+
+        mask
+    }
+}
+
+#[derive(Clone, Debug, Copy)]
+pub enum RelocationSize {
+    ByteSize(usize),
+    BitMasking(BitMask),
+}
+
+impl RelocationSize {
+    pub(crate) const fn bit_mask(
+        bit_start: u32,
+        bit_end: u32,
+        instruction: RelocationInstruction,
+    ) -> RelocationSize {
+        Self::BitMasking(BitMask::new(instruction, bit_start, bit_end))
+    }
+}
+
+#[derive(Clone, Debug, Copy)]
+pub struct BitMask {
+    pub instruction: RelocationInstruction,
+    pub range: BitRange,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PageMask {
+    SymbolPlusAddendAndPosition,
+    GotEntryAndPosition,
+    GotBase,
+}
+
+#[derive(Clone, Debug, Copy)]
+pub struct RelocationKindInfo {
+    pub kind: RelocationKind,
+    pub size: RelocationSize,
+    pub mask: Option<PageMask>,
+}
+
+impl BitMask {
+    #[must_use]
+    pub const fn new(instruction: RelocationInstruction, bit_start: u32, bit_end: u32) -> Self {
+        Self {
+            instruction,
+            range: BitRange {
+                start: bit_start,
+                end: bit_end,
+            },
+        }
+    }
+}
+
+/// Extract range-specified ([`start`..`end`]) bits from the provided `value`.
+#[must_use]
+pub fn extract_bits(value: u64, start: u32, end: u32) -> u64 {
+    debug_assert!(start < end);
+    (value >> (start)) & ((1 << (end - start)) - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object::elf::*;
+
+    #[test]
+    fn test_rel_type_to_string() {
+        assert_eq!(
+            &x86_64_rel_type_to_string(R_X86_64_32),
+            stringify!(R_X86_64_32)
+        );
+        assert_eq!(
+            &x86_64_rel_type_to_string(R_X86_64_GOTPC32_TLSDESC),
+            stringify!(R_X86_64_GOTPC32_TLSDESC)
+        );
+        assert_eq!(
+            &x86_64_rel_type_to_string(64),
+            "Unknown x86_64 relocation type 0x40"
+        );
+
+        assert_eq!(
+            &aarch64_rel_type_to_string(64),
+            "Unknown aarch64 relocation type 0x40"
+        );
+    }
+
+    #[test]
+    fn test_bit_operations() {
+        assert_eq!(0b11000, extract_bits(0b1100_0000, 3, 8));
+        assert_eq!(0b1010_1010_0000, extract_bits(0b10101010_00001111, 4, 16));
+        assert_eq!(u32::MAX, extract_bits(u64::MAX, 0, 32) as u32);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn test_extract_bits_wrong_range() {
+        let _ = extract_bits(0, 2, 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn test_extract_bits_too_large() {
+        let _ = extract_bits(0, 0, 100);
     }
 }

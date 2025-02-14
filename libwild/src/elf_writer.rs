@@ -14,6 +14,7 @@ use crate::args::WRITE_VERIFY_ALLOCATIONS_ENV;
 use crate::debug_assert_bail;
 use crate::elf;
 use crate::elf::slice_from_all_bytes_mut;
+use crate::elf::write_relocation_to_buffer;
 use crate::elf::DynamicEntry;
 use crate::elf::EhFrameHdr;
 use crate::elf::EhFrameHdrEntry;
@@ -96,6 +97,22 @@ use std::sync::Arc;
 use tracing::debug_span;
 use tracing::instrument;
 use uuid::Uuid;
+
+struct HexU64 {
+    value: u64,
+}
+
+impl HexU64 {
+    fn new(value: u64) -> Self {
+        Self { value }
+    }
+}
+
+impl Display for HexU64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:x}", self.value)
+    }
+}
 
 pub struct Output {
     path: Arc<Path>,
@@ -1798,7 +1815,7 @@ fn apply_relocation<S: StorageModel, A: Arch>(
     let _span = tracing::trace_span!(
         "relocation",
         address = original_place,
-        address_hex = format!("{original_place:x}")
+        address_hex = %HexU64::new(original_place)
     )
     .entered();
 
@@ -1825,21 +1842,20 @@ fn apply_relocation<S: StorageModel, A: Arch>(
     let output_kind = layout.args().output_kind();
     let symbol_name = layout.symbol_db.symbol_name(local_symbol_id)?;
 
-    if let Some(relaxation) = A::Relaxation::new(
+    let relaxation = A::Relaxation::new(
         r_type,
         out,
         offset_in_section,
         value_flags,
         output_kind,
         section_info.section_flags,
-    ) {
+    );
+    if let Some(relaxation) = &relaxation {
         rel_info = relaxation.rel_info();
-        tracing::trace!(kind = ?relaxation.debug_kind(), %value_flags, %resolution_flags, ?rel_info.kind, %symbol_name, "relaxation applied");
         relaxation.apply(out, &mut offset_in_section, &mut addend);
         next_modifier = relaxation.next_modifier();
     } else {
         rel_info = A::relocation_from_raw(r_type)?;
-        tracing::trace!(%value_flags, %resolution_flags, ?rel_info.kind, %symbol_name, "relocation applied");
     }
 
     // Compute place to which IP-relative relocations will be relative. This is different to
@@ -1989,9 +2005,14 @@ fn apply_relocation<S: StorageModel, A: Arch>(
             .wrapping_sub(layout.got_base().bitand(mask.got)),
         RelocationKind::None | RelocationKind::TlsDescCall => 0,
     };
-    rel_info
-        .size
-        .write_to_buffer(value, &mut out[offset_in_section as usize..])?;
+
+    if let Some(relaxation) = relaxation {
+        tracing::trace!(kind = ?relaxation.debug_kind(), %value_flags, %resolution_flags, ?rel_info.kind, value, value_hex = %HexU64::new(value), %symbol_name, "relaxation applied");
+    } else {
+        tracing::trace!(%value_flags, %resolution_flags, ?rel_info.kind, value, value_hex = %HexU64::new(value), %symbol_name, "relocation applied");
+    }
+
+    write_relocation_to_buffer(rel_info.size, value, &mut out[offset_in_section as usize..])?;
 
     Ok(next_modifier)
 }
@@ -2057,9 +2078,8 @@ fn apply_debug_relocation<S: StorageModel, A: Arch>(
         bail!("Could not find a relocation resolution for a debug info section");
     };
 
-    rel_info
-        .size
-        .write_to_buffer(value, &mut out[offset_in_section as usize..])?;
+    write_relocation_to_buffer(rel_info.size, value, &mut out[offset_in_section as usize..])?;
+
     Ok(())
 }
 
@@ -2172,12 +2192,19 @@ impl PreludeLayout {
             if merged.len() > 0 {
                 let buffer =
                     buffers.get_mut(section_id.part_id_with_alignment(crate::alignment::MIN));
-                for bucket in &merged.buckets {
-                    for string in &bucket.strings {
-                        let dest = crate::slice::slice_take_prefix_mut(buffer, string.len());
-                        dest.copy_from_slice(string);
-                    }
-                }
+
+                merged
+                    .buckets
+                    .iter()
+                    .map(|b| (b, slice_take_prefix_mut(buffer, b.len())))
+                    .par_bridge()
+                    .for_each(|(bucket, mut buffer)| {
+                        for string in &bucket.strings {
+                            let dest =
+                                crate::slice::slice_take_prefix_mut(&mut buffer, string.len());
+                            dest.copy_from_slice(string);
+                        }
+                    });
             }
         });
 

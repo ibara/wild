@@ -118,10 +118,8 @@ pub fn compute<'data, 'symbol_db, S: StorageModel, A: Arch>(
         custom_start_stop_defs,
     } = resolved;
 
-    if let Some(sym_info) = symbol_db.args.sym_info.as_deref() {
-        print_symbol_info(symbol_db, sym_info);
-    }
     let symbol_resolution_flags = vec![AtomicResolutionFlags::empty(); symbol_db.num_symbols()];
+
     let gc_outputs = find_required_sections::<S, A>(
         groups,
         symbol_db,
@@ -130,6 +128,16 @@ pub fn compute<'data, 'symbol_db, S: StorageModel, A: Arch>(
         &merged_strings,
         custom_start_stop_defs,
     )?;
+
+    if let Some(sym_info) = symbol_db.args.sym_info.as_deref() {
+        print_symbol_info(
+            symbol_db,
+            sym_info,
+            &symbol_resolution_flags,
+            &gc_outputs.group_states,
+        );
+    }
+
     let mut group_states = gc_outputs.group_states;
 
     merge_dynamic_symbol_definitions(&mut group_states)?;
@@ -2234,6 +2242,10 @@ impl<'data> FileLayoutState<'data> {
         };
         Ok(file_layout)
     }
+
+    fn is_loaded(&self) -> bool {
+        !matches!(self, FileLayoutState::NotLoaded(..))
+    }
 }
 
 fn compute_file_sizes(
@@ -2419,7 +2431,6 @@ fn process_relocation<S: StorageModel, A: Arch>(
         let symbol_db = resources.symbol_db;
         let symbol_id = symbol_db.definition(object.symbol_id_range.input_to_id(local_sym_index));
         let symbol_value_flags = symbol_db.local_symbol_value_flags(symbol_id);
-        let canonical_symbol_value_flags = symbol_db.symbol_value_flags(symbol_id);
         let rel_offset = rel.r_offset.get(LittleEndian);
         let r_type = rel.r_type(LittleEndian, false);
 
@@ -2449,7 +2460,7 @@ fn process_relocation<S: StorageModel, A: Arch>(
         {
             if section_is_writable {
                 common.allocate(part_id::RELA_DYN_GENERAL, elf::RELA_ENTRY_SIZE);
-            } else if canonical_symbol_value_flags.contains(ValueFlags::FUNCTION) {
+            } else if symbol_value_flags.contains(ValueFlags::FUNCTION) {
                 resolution_kind.remove(ResolutionFlags::DIRECT);
                 resolution_kind |= ResolutionFlags::PLT | ResolutionFlags::GOT;
             } else if !symbol_value_flags.contains(ValueFlags::ABSOLUTE) {
@@ -4414,7 +4425,17 @@ impl std::fmt::Debug for FileLayoutState<'_> {
     }
 }
 
-fn print_symbol_info<S: StorageModel>(symbol_db: &SymbolDb<S>, name: &str) {
+fn print_symbol_info<S: StorageModel>(
+    symbol_db: &SymbolDb<S>,
+    name: &str,
+    resolution_flags: &[AtomicResolutionFlags],
+    groups: &[GroupState],
+) {
+    let symbol_id = symbol_db
+        .global_names
+        .get(&SymbolName::prehashed(name.as_bytes()));
+    println!("Global name `{name}` refers to: {symbol_id:?}",);
+
     println!("Definitions / references with name `{name}`:");
     for i in 0..symbol_db.num_symbols() {
         let symbol_id = SymbolId::from_usize(i);
@@ -4430,12 +4451,22 @@ fn print_symbol_info<S: StorageModel>(symbol_db: &SymbolDb<S>, name: &str) {
                     match o.object.symbol(local_index) {
                         Ok(sym) => {
                             let canonical = symbol_db.definition(symbol_id);
+
+                            let file = &groups[file_id.group()].files[file_id.file()];
+                            let file_state = if file.is_loaded() {
+                                "LOADED"
+                            } else {
+                                "NOT LOADED"
+                            };
+
                             println!(
-                                "  {}: symbol_id={symbol_id} -> {canonical} {} \n    \
-                                #{local_index} in File #{file_id} {}",
+                                "  {}: symbol_id={symbol_id} -> {canonical} {value_flags} \
+                                    res=[{res_flags}] \n    \
+                                    #{local_index} in File #{file_id} {input} ({file_state})",
                                 crate::symbol::SymDebug(sym),
-                                symbol_db.local_symbol_value_flags(symbol_id),
-                                o.input,
+                                value_flags = symbol_db.local_symbol_value_flags(symbol_id),
+                                res_flags = resolution_flags[symbol_id.as_usize()].get(),
+                                input = o.input,
                             );
                         }
                         Err(e) => {

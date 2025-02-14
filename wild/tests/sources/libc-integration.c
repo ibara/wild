@@ -10,8 +10,10 @@
 //#DiffIgnore:section.rodata.cst32.entsize
 // This is only an issue on openSUSE
 //#DiffIgnore:section.rela.plt.link
+//#DiffIgnore:section.data.alignment
 //#CompArgs:-g -ftls-model=global-dynamic
 //#RequiresGlibc:true
+//#Cross: false
 
 //#Config:clang-static:default
 //#LinkArgs:--cc=clang -static -Wl,--strip-debug -Wl,--gc-sections -Wl,-z,now
@@ -76,6 +78,8 @@
 //#LinkArgs:--cc=gcc -dynamic -Wl,--strip-debug -Wl,--gc-sections -Wl,-z,now
 //#Shared:libc-integration-0.c
 //#Shared:libc-integration-1.c
+// TODO: cc1plus: sorry, unimplemented: code model 'large' with '-fPIC'
+//#Arch: x86_64
 
 #include <stdlib.h>
 #include <string.h>
